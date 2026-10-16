@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>P2P鬼ごっこ</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+:root{--bg:#f4f1ea;--fg:#222;--card:#fff;--ac:#e0432f;--arena:#e9e4d6;--wall:#6b5e4b;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#15171c;--fg:#eee;--card:#23262e;--arena:#1e2128;--wall:#7d8596}}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif;display:flex;flex-direction:column;align-items:center;gap:10px;padding:10px}
+h1{font-size:20px;margin:4px 0}
+.card{background:var(--card);border-radius:12px;padding:14px;width:100%;max-width:800px;box-sizing:border-box}
+input,button{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid #8886;background:var(--bg);color:var(--fg)}
+button{background:var(--ac);color:#fff;border:0;cursor:pointer;font-weight:700}
+button.sub{background:#4a6fa5}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+#game{display:none;width:100%;max-width:800px}
+canvas{width:100%;aspect-ratio:8/5;background:var(--arena);border-radius:12px;touch-action:none;display:block}
+#list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:14px}
+.chip{padding:3px 9px;border-radius:99px;background:var(--card)}
+.chip.it{background:var(--ac);color:#fff}
+small{opacity:.7}
+#link{width:100%;box-sizing:border-box}
+</style></head><body>
+<h1>👹 P2P鬼ごっこ（最大10人）</h1>
+<div class="card" id="lobby">
+  <div class="row"><label>名前 <input id="name" maxlength="8" placeholder="なまえ"></label></div>
+  <div class="row"><button id="host">部屋を作る（ホスト）</button></div>
+  <div class="row"><label>または参加コード <input id="code" placeholder="oni-xxxxxx"></label><button class="sub" id="join">参加する</button></div>
+  <small>ホストが「部屋を作る」を押すと招待リンクが出ます。友達がそのリンクを開くと自動で参加画面になります。<br>操作：矢印キー / WASD、スマホは画面をドラッグ。</small>
+  <div id="msg" style="margin-top:8px"></div>
+</div>
+<div id="game">
+  <div class="card" style="padding:10px;margin-bottom:8px">
+    <div id="status">接続中…</div>
+    <div id="invite" style="display:none;margin-top:8px">
+      <div class="row" style="margin:0"><input id="link" readonly><button id="copy">リンクをコピー</button></div>
+    </div>
+  </div>
+  <canvas id="cv" width="800" height="500"></canvas>
+  <div id="list"></div>
+  <small>鬼にタッチされたら交代！ 逃げた秒数がスコア。新しい鬼は2.5秒止まります。</small>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const W=800,H=500,R=14,MAX=10;
+const walls=[[250,120,20,140],[530,240,20,140],[360,340,120,20],[120,380,100,20],[600,80,100,20],[100,120,80,20]];
+const hit=(x,y)=>x<R||x>W-R||y<R||y>H-R||walls.some(([a,b,w,h])=>x>a-R&&x<a+w+R&&y>b-R&&y<b+h+R);
+const spawn=()=>{for(let i=0;i<50;i++){const x=R+Math.random()*(W-2*R),y=R+Math.random()*(H-2*R);if(!hit(x,y))return{x,y}}return{x:40,y:40}};
+const hue=s=>{let h=0;for(const c of s)h=(h*31+c.charCodeAt(0))%360;return h};
+const mk=(n,id)=>({id,n:String(n).slice(0,8),c:hue(id),...spawn(),it:false,fz:false,s:0});
+
+let peer,myId,isHost=false,hostConn=null,conns={},players={},me={x:0,y:0},started=false;
+try{$("name").value=localStorage.getItem("oni-name")||""}catch(e){}
+const hashId=location.hash.slice(1);
+if(hashId){$("code").value=hashId;$("msg").textContent="招待リンクから開きました。名前を入れて「参加する」を押してください。"}
+const getName=()=>{const n=($("name").value.trim()||"ゲスト").slice(0,8);try{localStorage.setItem("oni-name",n)}catch(e){}return n};
+const err=m=>{$("msg").textContent=m;$("status").textContent=m};
+
+$("host").onclick=()=>{isHost=true;const id="oni-"+Math.random().toString(36).slice(2,8);boot(getName(),id)};
+$("join").onclick=()=>{const c=$("code").value.trim();if(!c){$("msg").textContent="参加コードを入れてください";return}boot(getName(),null,c)};
+$("copy").onclick=()=>{$("link").select();navigator.clipboard?.writeText($("link").value).catch(()=>document.execCommand("copy"));$("copy").textContent="コピーしました"};
+
+function boot(name,hostPeerId,joinId){
+  if(typeof Peer==="undefined"){$("msg").textContent="PeerJSを読み込めませんでした。ネット接続を確認してください。";return}
+  $("msg").textContent="接続中…";
+  peer=new Peer(hostPeerId||undefined);
+  peer.on("error",e=>err("エラー: "+(e.type||e)+(e.type==="peer-unavailable"?"（コードが違うか、ホストが閉じています）":"")));
+  peer.on("open",id=>{
+    myId=id;
+    if(isHost){
+      players[id]=mk(name,id);
+      const m=players[id];me.x=m.x;me.y=m.y;
+      $("lobby").style.display="none";$("game").style.display="block";
+      $("link").value=location.href.split("#")[0]+"#"+id;$("invite").style.display="block";
+      hostSetup();run();
+    }else{
+      hostConn=peer.connect(joinId,{serialization:"json"});
+      hostConn.on("open",()=>hostConn.send({t:"hello",n:name}));
+      hostConn.on("data",d=>{
+        if(d.t==="welcome"){const mm=d.me;me.x=mm.x;me.y=mm.y;$("lobby").style.display="none";$("game").style.display="block";run()}
+        else if(d.t==="full"){$("msg").textContent="満員です（最大"+MAX+"人）"}
+        else if(d.t==="w"){const o={};d.p.forEach(p=>o[p.id]=p);players=o}
+      });
+      hostConn.on("close",()=>{$("status").textContent="🔴 ホストとの接続が切れました。リロードしてください。";started=false});
+    }
+  });
+}
+
+function hostSetup(){
+  peer.on("connection",c=>{
+    c.on("data",d=>{
+      if(d.t==="hello"){
+        if(Object.keys(players).length>=MAX){c.send({t:"full"});setTimeout(()=>c.close(),300);return}
+        conns[c.peer]=c;players[c.peer]=mk(d.n||"ゲスト",c.peer);c.send({t:"welcome",me:players[c.peer]});
+      }else if(d.t==="s"&&players[c.peer]){const p=players[c.peer];if(!hit(d.x,d.y)){p.x=d.x;p.y=d.y}}
+    });
+    const gone=()=>{delete players[c.peer];delete conns[c.peer]};
+    c.on("close",gone);c.on("error",gone);
+  });
+  let noOni=0;const dt=.05;
+  setInterval(()=>{
+    const ps=Object.values(players);
+    if(ps.length>=2){
+      if(!ps.some(p=>p.it)){noOni+=dt;if(noOni>1){const p=ps[Math.floor(Math.random()*ps.length)];p.it=true;noOni=0}}
+      else noOni=0;
+      const oni=ps.find(p=>p.it);
+      if(oni&&!oni.fz){
+        for(const r of ps){if(r===oni)continue;
+          if(Math.hypot(r.x-oni.x,r.y-oni.y)<R*2.1){oni.it=false;r.it=true;r.fz=true;setTimeout(()=>{r.fz=false},2500);break}}
+      }
+      ps.forEach(p=>{if(!p.it)p.s+=dt});
+    }else ps.forEach(p=>p.it=false);
+    const msg={t:"w",p:Object.values(players)};
+    for(const id in conns){try{conns[id].send(msg)}catch(e){}}
+  },50);
+}
+
+function run(){
+  if(started)return;started=true;
+  const cv=$("cv"),ctx=cv.getContext("2d");
+  const keys=new Set();let joy=null,last=performance.now(),sent=0;const disp={};
+  addEventListener("keydown",e=>{keys.add(e.key.toLowerCase());if(e.key.startsWith("Arrow"))e.preventDefault()});
+  addEventListener("keyup",e=>keys.delete(e.key.toLowerCase()));
+  cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId);joy={sx:e.clientX,sy:e.clientY,dx:0,dy:0}};
+  cv.onpointermove=e=>{if(joy){joy.dx=e.clientX-joy.sx;joy.dy=e.clientY-joy.sy}};
+  cv.onpointerup=cv.onpointercancel=()=>joy=null;
+  function frame(t){
+    if(!started)return;
+    const dt=Math.min(.05,(t-last)/1000);last=t;
+    const mp=players[myId]||{};
+    let dx=0,dy=0;
+    if(keys.has("arrowleft")||keys.has("a"))dx--;if(keys.has("arrowright")||keys.has("d"))dx++;
+    if(keys.has("arrowup")||keys.has("w"))dy--;if(keys.has("arrowdown")||keys.has("s"))dy++;
+    if(joy){const l=Math.hypot(joy.dx,joy.dy);if(l>10){dx=joy.dx/l;dy=joy.dy/l}}
+    const l=Math.hypot(dx,dy);
+    if(l>0&&!mp.fz){const sp=(mp.it?215:200)*dt;dx=dx/l*sp;dy=dy/l*sp;
+      if(!hit(me.x+dx,me.y))me.x+=dx;if(!hit(me.x,me.y+dy))me.y+=dy}
+    if(isHost&&players[myId]){players[myId].x=me.x;players[myId].y=me.y}
+    else if(hostConn&&hostConn.open&&t-sent>45){sent=t;hostConn.send({t:"s",x:Math.round(me.x),y:Math.round(me.y)})}
+    ctx.clearRect(0,0,W,H);
+    const cs=getComputedStyle(document.documentElement);
+    ctx.fillStyle=cs.getPropertyValue("--wall");walls.forEach(([a,b,w,h])=>ctx.fillRect(a,b,w,h));
+    ctx.textAlign="center";ctx.font="bold 13px system-ui,sans-serif";
+    const fg=cs.getPropertyValue("--fg");
+    for(const p of Object.values(players)){
+      let x,y;const self=p.id===myId;
+      if(self){x=me.x;y=me.y}else{const d=disp[p.id]||(disp[p.id]={x:p.x,y:p.y});d.x+=(p.x-d.x)*.35;d.y+=(p.y-d.y)*.35;x=d.x;y=d.y}
+      ctx.beginPath();ctx.arc(x,y,R,0,7);ctx.fillStyle=p.it?"#e0432f":`hsl(${p.c},70%,55%)`;ctx.fill();
+      ctx.lineWidth=self?4:2;ctx.strokeStyle=self?"#fff":"#0005";ctx.stroke();
+      if(p.fz){ctx.setLineDash([4,4]);ctx.strokeStyle="#ffd54a";ctx.lineWidth=3;ctx.beginPath();ctx.arc(x,y,R+6,0,7);ctx.stroke();ctx.setLineDash([])}
+      if(p.it){ctx.fillStyle="#fff";ctx.fillText("鬼",x,y+5)}
+      ctx.fillStyle=fg;ctx.fillText(p.n+(self?"（あなた）":""),x,y-R-6);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  setInterval(()=>{
+    const ps=Object.values(players);
+    if(!(hostConn&&!hostConn.open&&!isHost))$("status").textContent=`🟢 ${isHost?"ホスト":"参加中"} ／ ${ps.length}/${MAX}人`+(ps.length<2?" ／ 友達を待っています…":"");
+    const list=$("list");list.textContent="";
+    ps.sort((a,b)=>b.s-a.s).forEach(p=>{const c=document.createElement("span");c.className="chip"+(p.it?" it":"");
+      c.textContent=(p.it?"👹 ":"")+p.n+(p.id===myId?"（自分）":"")+"："+Math.floor(p.s)+"秒";list.appendChild(c)});
+  },400);
+}
+</script>
+</body></html>
